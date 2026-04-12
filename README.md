@@ -1,5 +1,19 @@
 # solana-pnl , Helius mini dev weekend challenge
 
+
+results from my test home on the main run (cmd/pnl/main.go):
+```
+C:\Users\syrof\OneDrive\Desktop\solana-pnl>go run cmd/pnl/main.go
+DdbBbLpXvLJuyN2d1qnkA5DufojkUxGsdVQmjuZaXknv | PnL: +0.040017121 SOL | slots: 308060352 … 401140586 | 126 ms
+CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o | PnL: +811.044330083 SOL | slots: 317524721 … 412685384 | 87 ms
+AuPp4YTMTyqxYXQnHc5KUc6pUuCSsHQpBJhgnD45yqrf | PnL: +219.978264405 SOL | slots: 321788731 … 412627847 | 79 ms
+9yYya3F5EJoLnBNKW6z4bZvyQytMXzDcpU5D6yYr4jqL | PnL: +65.711961535 SOL | slots: 265894120 … 412722279 | 81 ms
+Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt | PnL: +221.837605598 SOL | slots: 331094960 … 412730857 | 80 ms
+---
+wallets: 5 ok | avg lookup: 90 ms | wall: 455 ms
+```
+
+
 Hey, this is my take on the **lowest-latency SOL PnL** challenge: compute PnL from **plain RPC** (no indexer), using **`getTransactionsForAddress`** so you're not stuck with the old one-way `getSignaturesForAddress` crawl.
 
 ## What the challenge is asking for
@@ -40,18 +54,6 @@ So: **algorithm = tiny number of RPCs; "speed work" = mostly making those RPCs c
 - Integration tests hit the real RPC if `RPC_URL` is set.
 - There's a **benchmark** in `tests/` for end-to-end `ns/op` , which i was using heavily to optimize latency. im sure helius's dev team can optimize this further to essentially cut the network latency further since i was running this on my home pc.
 
-
-results from my test home on the main run (cmd/pnl/main.go):
-```
-C:\Users\syrof\OneDrive\Desktop\solana-pnl>go run cmd/pnl/main.go
-DdbBbLpXvLJuyN2d1qnkA5DufojkUxGsdVQmjuZaXknv | PnL: +0.040017121 SOL | slots: 308060352 … 401140586 | 126 ms
-CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o | PnL: +811.044330083 SOL | slots: 317524721 … 412685384 | 87 ms
-AuPp4YTMTyqxYXQnHc5KUc6pUuCSsHQpBJhgnD45yqrf | PnL: +219.978264405 SOL | slots: 321788731 … 412627847 | 79 ms
-9yYya3F5EJoLnBNKW6z4bZvyQytMXzDcpU5D6yYr4jqL | PnL: +65.711961535 SOL | slots: 265894120 … 412722279 | 81 ms
-Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt | PnL: +221.837605598 SOL | slots: 331094960 … 412730857 | 80 ms
----
-wallets: 5 ok | avg lookup: 90 ms | wall: 455 ms
-```
 
 ---
 
