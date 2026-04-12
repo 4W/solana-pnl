@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -13,91 +13,88 @@ import (
 	"solana-pnl/internal/pnl"
 )
 
-const defaultAddress = "BqjxAhvmj1aK6GrcrqfHMaASKPxFL9eSne1HXEfxpRde"
+var defaultWallets = []string{
+	"DdbBbLpXvLJuyN2d1qnkA5DufojkUxGsdVQmjuZaXknv",
+	"CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o",
+	"AuPp4YTMTyqxYXQnHc5KUc6pUuCSsHQpBJhgnD45yqrf",
+	"9yYya3F5EJoLnBNKW6z4bZvyQytMXzDcpU5D6yYr4jqL",
+	"Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt",
+}
 
 func main() {
 	_ = godotenv.Load()
 
-	addr := flag.String("address", defaultAddress, "wallet pubkey (base58)")
-	flag.Parse()
+	args := os.Args[1:]
+	wallets := make([]string, 0, len(args))
+	for _, a := range args {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			wallets = append(wallets, a)
+		}
+	}
+	if len(wallets) == 0 {
+		wallets = defaultWallets
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
-	c, conc, err := helius.NewFromEnv()
+	c, _, err := helius.NewFromEnv()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "client: %v\n", err)
 		os.Exit(1)
 	}
-	k := pnl.PartitionCount(conc)
 
-	minSlot, maxSlot, empty, err := pnl.DiscoverSlotBounds(ctx, c, *addr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "bounds: %v\n", err)
+	deadline := time.Duration(len(wallets)) * 90 * time.Second
+	if deadline < 2*time.Minute {
+		deadline = 2 * time.Minute
+	}
+	if deadline > 30*time.Minute {
+		deadline = 30 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+
+	if err := c.Warmup(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "warmup: %v\n", err)
 		os.Exit(1)
 	}
-	if empty {
-		fmt.Println("no transactions for address")
-		return
-	}
 
-	span := maxSlot - minSlot + 1
-	fmt.Fprintf(os.Stderr, "[pnl] slot range [%d, %d] (%d slots); starting fetch (K=%d partitions, adapt=true)\n",
-		minSlot, maxSlot, span, k)
-	if span > 10_000_000 {
-		fmt.Fprintf(os.Stderr, "[pnl] warning: very large activity window — full history can take hours or days.\n")
-	}
-	fmt.Fprintf(os.Stderr, "[pnl] progress: stderr heartbeat every 15s while fetching (10m deadline)…\n")
+	runStart := time.Now()
+	var sumMs int64
+	var okN, failN int
 
-	t0 := time.Now()
-	stopBeat := make(chan struct{})
-	go func() {
-		tick := time.NewTicker(15 * time.Second)
-		defer tick.Stop()
-		for {
-			select {
-			case <-stopBeat:
-				return
-			case <-tick.C:
-				fmt.Fprintf(os.Stderr, "[pnl] still fetching… %s elapsed\n", time.Since(t0).Round(time.Second))
-			}
+	for _, addr := range wallets {
+		t0 := time.Now()
+		pnlLamports, firstSlot, lastSlot, empty, err := pnl.TotalLamportsPnL(ctx, c, addr)
+		ms := time.Since(t0).Milliseconds()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%s: %v\n", addr, err)
+			failN++
+			continue
 		}
-	}()
-
-	rows, err := pnl.FetchAllTransactions(ctx, c, *addr, minSlot, maxSlot, k)
-	close(stopBeat)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "fetch: %v\n", err)
-		os.Exit(1)
-	}
-	fetchDur := time.Since(t0)
-
-	t1 := time.Now()
-	series, err := pnl.BuildBalanceSeries(*addr, rows)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "balance: %v\n", err)
-		os.Exit(1)
-	}
-	buildDur := time.Since(t1)
-
-	meta := map[string]any{
-		"address":          *addr,
-		"minSlot":          minSlot,
-		"maxSlot":          maxSlot,
-		"transactionCount": len(rows),
-		"points":           len(series),
-		"fetchMs":          fetchDur.Milliseconds(),
-		"buildMs":          buildDur.Milliseconds(),
-		"totalMs":          time.Since(t0).Milliseconds(),
-	}
-
-	fmt.Fprintf(os.Stderr, "# %+v\n", meta)
-	fmt.Println("slot,tx_index,block_time_unix,signature,lamports_delta,lamports_after")
-	for _, p := range series {
-		bt := ""
-		if p.BlockTime != nil {
-			bt = fmt.Sprintf("%d", *p.BlockTime)
+		sumMs += ms
+		okN++
+		if empty {
+			fmt.Printf("%s | PnL: 0.000000000 SOL | slots: — … — | %d ms\n", addr, ms)
+			continue
 		}
-		fmt.Printf("%d,%d,%s,%s,%d,%d\n", p.Slot, p.TransactionIndex, bt, p.Signature, p.LamportsDelta, p.LamportsAfter)
+		sol := float64(pnlLamports) / 1e9
+		sign := ""
+		if pnlLamports >= 0 {
+			sign = "+"
+		}
+		fmt.Printf("%s | PnL: %s%.9f SOL | slots: %d … %d | %d ms\n", addr, sign, sol, firstSlot, lastSlot, ms)
+	}
+
+	totalMs := time.Since(runStart).Milliseconds()
+	fmt.Printf("---\nwallets: %d ok", okN)
+	if failN > 0 {
+		fmt.Printf(", %d failed", failN)
+	}
+	if okN > 0 {
+		fmt.Printf(" | avg lookup: %d ms", sumMs/int64(okN))
+	}
+	fmt.Printf(" | wall: %d ms\n", totalMs)
+
+	if failN > 0 {
+		os.Exit(1)
 	}
 }

@@ -1,35 +1,35 @@
 package helius
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/valyala/fasthttp"
+	"github.com/bytedance/sonic"
 	"golang.org/x/sync/semaphore"
 	"golang.org/x/time/rate"
 )
 
-const (
-	defaultRateRPS   = 500
-	defaultRateBurst = 1000
-)
+const defaultRateRPS = 500
 
 type Client struct {
 	endpoint string
-	fast     *fasthttp.Client
+	http     *http.Client
 	sem      *semaphore.Weighted
 	limit    *rate.Limiter
-	mu       sync.Mutex
-	nextID   int64
+	nextID   atomic.Int64
 }
 
 func NewFromEnv() (*Client, int, error) {
@@ -38,51 +38,97 @@ func NewFromEnv() (*Client, int, error) {
 		return nil, 0, fmt.Errorf("set RPC_URL to your Solana HTTP JSON-RPC endpoint (e.g. https://mainnet.helius-rpc.com/?api-key=...)")
 	}
 
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, 0, fmt.Errorf("RPC_URL: %w", err)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return nil, 0, fmt.Errorf("RPC_URL scheme must be http or https")
+	}
+
 	rps := float64(defaultRateRPS)
 	if s := strings.TrimSpace(os.Getenv("HELIUS_RATE_RPS")); s != "" {
 		if v, err := strconv.ParseFloat(s, 64); err == nil && v > 0 {
 			rps = v
 		}
 	}
-	burst := defaultRateBurst
-	if s := strings.TrimSpace(os.Getenv("HELIUS_RATE_BURST")); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v > 0 {
-			burst = v
-		}
-	}
 
-	concurrency := int(math.Max(1, math.Round(rps)))
+	lim := rate.NewLimiter(rate.Inf, 0)
+	concurrency := max(64, int(math.Round(rps)))
 	semWeight := int64(concurrency)
 
 	tlsCfg := &tls.Config{
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
+		ClientSessionCache: tls.NewLRUClientSessionCache(128),
+		NextProtos:         []string{"h2", "http/1.1"},
+		CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
 	}
 
-	fastCl := &fasthttp.Client{
-		TLSConfig:                     tlsCfg,
-		ReadTimeout:                   120 * time.Second,
-		WriteTimeout:                  120 * time.Second,
-		MaxIdleConnDuration:           90 * time.Second,
-		MaxConnsPerHost:               2048,
-		NoDefaultUserAgentHeader:      true,
-		DisableHeaderNamesNormalizing: true,
-		DisablePathNormalizing:        true,
+	var tr *http.Transport
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = t.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+
+	tr.DisableCompression = true
+	tr.MaxIdleConns = 512
+	tr.MaxIdleConnsPerHost = 256
+	tr.IdleConnTimeout = 5 * time.Minute
+	tr.TLSHandshakeTimeout = 10 * time.Second
+	tr.ResponseHeaderTimeout = 60 * time.Second
+	tr.ReadBufferSize = 64 * 1024
+	tr.WriteBufferSize = 16 * 1024
+
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		setTCPNoDelay(conn)
+		return conn, nil
+	}
+
+	if strings.EqualFold(u.Scheme, "https") {
+		tr.TLSClientConfig = tlsCfg
+		tr.ForceAttemptHTTP2 = true
+	} else {
+		tr.TLSClientConfig = nil
+		tr.ForceAttemptHTTP2 = false
+	}
+
+	httpCl := &http.Client{
+		Transport: tr,
+		Timeout:   0,
 	}
 
 	return &Client{
 		endpoint: endpoint,
-		fast:     fastCl,
+		http:     httpCl,
 		sem:      semaphore.NewWeighted(semWeight),
-		limit:    rate.NewLimiter(rate.Limit(rps), burst),
+		limit:    lim,
 	}, concurrency, nil
 }
 
-func (c *Client) nextJSONRPCID() int64 {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.nextID++
-	return c.nextID
+func setTCPNoDelay(c net.Conn) {
+	for c != nil {
+		switch t := c.(type) {
+		case *net.TCPConn:
+			_ = t.SetNoDelay(true)
+			return
+		case interface{ NetConn() net.Conn }:
+			c = t.NetConn()
+		default:
+			return
+		}
+	}
 }
 
 func (c *Client) Call(ctx context.Context, method string, params []any, out any) error {
@@ -95,14 +141,14 @@ func (c *Client) Call(ctx context.Context, method string, params []any, out any)
 		return err
 	}
 
-	id := c.nextJSONRPCID()
+	id := c.nextID.Add(1)
 	body := map[string]any{
 		"jsonrpc": "2.0",
 		"id":      id,
 		"method":  method,
 		"params":  params,
 	}
-	raw, err := json.Marshal(body)
+	raw, err := sonic.Marshal(body)
 	if err != nil {
 		return err
 	}
@@ -119,7 +165,7 @@ func (c *Client) Call(ctx context.Context, method string, params []any, out any)
 			}
 		}
 
-		b, status, err := c.postFastHTTP(ctx, raw)
+		b, status, err := c.postHTTP(ctx, raw)
 		if err != nil {
 			lastErr = err
 			continue
@@ -140,30 +186,25 @@ func (c *Client) Call(ctx context.Context, method string, params []any, out any)
 	return fmt.Errorf("rpc: exhausted retries")
 }
 
-func (c *Client) postFastHTTP(ctx context.Context, raw []byte) ([]byte, int, error) {
-	req := fasthttp.AcquireRequest()
-	resp := fasthttp.AcquireResponse()
-	defer fasthttp.ReleaseRequest(req)
-	defer fasthttp.ReleaseResponse(resp)
-
-	req.SetRequestURI(c.endpoint)
-	req.Header.SetMethod(fasthttp.MethodPost)
-	req.Header.SetContentType("application/json")
-	req.SetBody(raw)
-
-	timeout := 120 * time.Second
-	if dl, ok := ctx.Deadline(); ok {
-		if d := time.Until(dl); d > 0 && d < timeout {
-			timeout = d
-		}
-	}
-	err := c.fast.DoTimeout(req, resp, timeout)
+func (c *Client) postHTTP(ctx context.Context, raw []byte) ([]byte, int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, 0, err
 	}
-	status := resp.StatusCode()
-	body := append([]byte(nil), resp.Body()...)
-	return body, status, nil
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(raw))
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+	return body, resp.StatusCode, nil
 }
 
 func decodeJSONRPCEnvelope(b []byte, out any) error {
@@ -177,7 +218,7 @@ func decodeJSONRPCEnvelope(b []byte, out any) error {
 			Data    json.RawMessage `json:"data"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal(b, &envelope); err != nil {
+	if err := sonic.Unmarshal(b, &envelope); err != nil {
 		return fmt.Errorf("decode envelope: %w", err)
 	}
 	if envelope.Error != nil {
@@ -186,7 +227,7 @@ func decodeJSONRPCEnvelope(b []byte, out any) error {
 	if out == nil {
 		return nil
 	}
-	if err := json.Unmarshal(envelope.Result, out); err != nil {
+	if err := sonic.Unmarshal(envelope.Result, out); err != nil {
 		return fmt.Errorf("decode result: %w", err)
 	}
 	return nil
@@ -207,4 +248,9 @@ func (c *Client) GetTransactionsForAddressPage(ctx context.Context, address stri
 		return nil, err
 	}
 	return &res, nil
+}
+
+func (c *Client) Warmup(ctx context.Context) error {
+	var out string
+	return c.Call(ctx, "getHealth", []any{}, &out)
 }
