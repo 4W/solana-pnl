@@ -20,13 +20,20 @@ Hey, this is my take on the **lowest-latency SOL PnL** challenge: compute PnL fr
 
 You need **SOL PnL** at runtime with **only RPC**. The tricky part isn't really "math on the balances", it's **how little work you can do on the wire** when you don't know if a wallet is sparse or absolutely slammed with txs.
 
-## The core idea (the part that actually matters)
+## Algorithm
 
-There's a clean telescoping identity: net change in lamports across **all** txs for an address is just **`post(last) − pre(first)`** on that address's balance slots in meta , so you only need the **first** and **last** transaction in time, not the whole chain.
+**What we compute.** "SOL PnL" here is **net lamport change over the wallet’s full on-chain history**: balance after the latest touch minus balance before the earliest touch. That is a single scalar, not a time series.
 
-That maps to **two** `getTransactionsForAddress` calls (asc `limit: 1` + desc `limit: 1`, full tx + `jsonParsed`), in parallel. Same rough latency whether someone has 200 txs or 200k , you're not paginating history for the number itself.
+**Why you don’t need every transaction.** For one account, the deltas across txs telescope: the sum of all balance changes equals **`postBalances[i]` on the last tx** minus **`preBalances[i]` on the first tx**, where `i` is that account’s index in each transaction’s meta. So total PnL depends only on **boundary** rows, not on how dense or sparse the middle is.
 
-That's the algorithmic win. Everything else is "make those two round trips not hurt more than they have to."
+**RPC shape.** With `getTransactionsForAddress` you can ask for exactly those boundaries:
+
+- `sortOrder: "asc"`, `limit: 1` → earliest matching tx for the address  
+- `sortOrder: "desc"`, `limit: 1` → latest matching tx for the address  
+
+Run those **in parallel**. Use `transactionDetails: "full"` (or enough to get `meta`), `encoding: "jsonParsed"`, and filters consistent with ""SOL-only" intent (e.g. `tokenAccounts: "none"`). Resolve the wallet's index in the full account key list (including **loaded addresses** on versioned txs), then read `preBalances` / `postBalances` at that index.
+
+**Cost vs history size.** Work on the wire is **two** GTFA calls regardless of whether the wallet has hundreds or hundreds of thousands of transactions—no pagination for the number itself. The rest of the codebase is mostly about making those two round trips fast.
 
 ## Where we actually spent effort: the network stack
 
